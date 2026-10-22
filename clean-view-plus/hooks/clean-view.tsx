@@ -1,0 +1,1320 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, On, RenderElement, RenderInput, Timer } from 'claude-code'
+
+import type { CleanViewChecklist, CleanViewMode, CleanViewPhase, CleanViewSubtask, CleanViewTask } from '../types'
+
+type Engine = EngineInterface
+
+const PLAN_TOOL = 'mcp__clean-view-plus__plan_steps'
+const PROGRESS_TOOL = 'mcp__clean-view-plus__report_progress'
+const STORE_KEY = 'cleanViewMode'
+/** The on/off value saved before the both mode existed. */
+const LEGACY_STORE_KEY = 'cleanViewEnabled'
+const SECTION_ID = 'clean-view:checklist'
+
+const MAX_NAME = 40
+const FALLBACK_NAME = 'Working on it'
+const METER_CELLS = 16
+const FRAME_MS = 250
+const FAIL_LIMIT = 3
+const MIN_STEPS = 2
+const MAX_STEPS = 8
+const MAX_SUBSTEPS = 6
+/** Actions kept per step; the count keeps the rest. */
+const MAX_ACTIONS = 3
+
+const ALWAYS_ALLOWED = new Set([
+  'ToolSearch',
+  'TodoWrite',
+  'TaskCreate',
+  'TaskUpdate',
+  'AskUserQuestion',
+  PLAN_TOOL,
+])
+
+/** Calls that keep the plan itself; they are not work to list under a step. */
+const PLAN_KEEPING = new Set(['ToolSearch', 'TodoWrite', 'TaskCreate', 'TaskUpdate', PLAN_TOOL, PROGRESS_TOOL])
+
+const PLACEHOLDER_STEPS = ['Understand your request', 'Plan the steps']
+
+const NEEDS_OK = 'Claude needs your OK to continue'
+const HAS_QUESTION = 'Claude has a question for you'
+const WAITING_REPLY = 'Claude is waiting for your reply'
+const SAID_NO = 'you said no to a step, so Claude paused'
+const KEEPS_FAILING = 'a step keeps failing, Claude is trying another way'
+const REFUSED = "Claude couldn't help with that request"
+const API_USAGE = 'you hit your usage limit, try again a little later'
+const API_BUSY = "Claude's servers are busy, try again in a minute"
+const API_TOO_LONG = 'type /compact and try again'
+const API_NETWORK = 'the internet connection dropped'
+const API_AUTH = 'type /login'
+const API_OTHER = 'something went wrong talking to Claude, try again'
+
+const USER_SAID_NO = /doesn't want to proceed|tool use was rejected/i
+
+const GATE_MESSAGE =
+  `Clean View: call ${PLAN_TOOL} first to lay out the steps of this job in plain English ` +
+  '(load it with ToolSearch if it is deferred). Then try this tool again.'
+
+const CODE_EXTENSIONS =
+  'tsx?|jsx?|mjs|cjs|mts|cts|py|rb|go|rs|java|kt|kts|swift|c|cc|cpp|h|hpp|cs|php|sh|bash|zsh|fish|ps1|' +
+  'json|jsonc|ya?ml|toml|ini|env|lock|md|mdx|html?|css|scss|sass|less|sql|vue|svelte|xml|gradle|tf|dart|lua|r'
+const FILE_NAME = new RegExp(`^[("'\\[]*[\\w.-]+\\.(${CODE_EXTENSIONS})[)"'\\],.:;!?]*$`, 'i')
+
+const EMPTY: CleanViewChecklist = {
+  title: '',
+  phase: 'idle',
+  tasks: [],
+  needsYouReason: null,
+  stuckReason: null,
+  startedAt: null,
+  finishedAt: null,
+  isPlanned: false,
+}
+
+const MODES: readonly CleanViewMode[] = ['on', 'both', 'off']
+
+const MODE_LABEL: Record<CleanViewMode, string> = {
+  on: '● Clean View: ON',
+  both: '◐ Clean View: BOTH',
+  off: '○ Clean View: OFF',
+}
+
+const MODE_TOAST: Record<CleanViewMode, string> = {
+  on: 'Clean View is on. Technical details are hidden.',
+  both: 'Clean View is on. You see the checklist and every detail.',
+  off: 'Clean View is off. You see every detail again.',
+}
+
+/** The Toolbox row's choices, in /simple's order. */
+const MODE_CHOICE: Record<CleanViewMode, string> = {
+  on: 'On',
+  both: 'Both',
+  off: 'Off',
+}
+
+const MODE_REPLY: Record<CleanViewMode, string> = {
+  on: 'Clean View is on.',
+  both: 'Clean View is on, with every detail shown.',
+  off: 'Clean View is off.',
+}
+
+const MODE = { plugin: 'clean-view-plus', key: 'mode' } as const
+const mode = atom(MODE, 'on' as CleanViewMode)
+const checklist = atom({ plugin: 'clean-view-plus', key: 'checklist' } as const, EMPTY)
+const tick = atom({ plugin: 'clean-view-plus', key: 'tick' } as const, 0)
+
+/** Turns any step or job name into short plain English with no code in it. */
+export function cleanName(raw: string): string {
+  const words = raw
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/`/g, ' ')
+    .split(/\s+/)
+    .filter(word => word !== '' && !word.includes('/') && !word.includes('\\') && !FILE_NAME.test(word))
+  const text = words.join(' ').replace(/\s+/g, ' ').trim()
+
+  if (text === '') {
+    return FALLBACK_NAME
+  }
+
+  const named = text[0]!.toUpperCase() + text.slice(1)
+
+  if (named.length <= MAX_NAME) {
+    return named
+  }
+
+  const head = named.slice(0, MAX_NAME - 1)
+  const space = head.lastIndexOf(' ')
+  const cut = (space > 0 ? head.slice(0, space) : head).replace(/[\s,.;:!?-]+$/, '')
+
+  return `${cut}…`
+}
+
+function jobTitle(raw: string): string {
+  const firstLine = raw.split('\n').find(line => line.trim() !== '') ?? ''
+  const words = cleanName(firstLine.replace(/["'*_#.]/g, ' ')).replace(/…$/, '').split(' ')
+
+  return cleanName(words.slice(0, 6).join(' '))
+}
+
+function elapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`
+  }
+
+  return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`
+}
+
+function clampPercent(value: unknown): number {
+  const number = Number(value)
+
+  return Number.isFinite(number) ? Math.min(100, Math.max(0, Math.round(number))) : 0
+}
+
+function isMode(value: unknown): value is CleanViewMode {
+  return MODES.includes(value as CleanViewMode)
+}
+
+function nextMode(current: CleanViewMode): CleanViewMode {
+  return MODES[(MODES.indexOf(current) + 1) % MODES.length]!
+}
+
+/**
+ * The mode now. A /clear starts the session's state over, and no event this
+ * mod can count on fires after it, so a mode not set yet this session comes
+ * from the store.
+ */
+async function currentMode($: Engine): Promise<CleanViewMode> {
+  const { value } = await $.state.get(MODE)
+
+  return isMode(value) ? value : storedMode($)
+}
+
+/** The checklist runs in `on` and `both`. */
+async function isTracking($: Engine): Promise<boolean> {
+  return (await currentMode($)) !== 'off'
+}
+
+/** Tool rows are hidden only in `on`; `both` keeps them next to the checklist. */
+async function isHiding($: Engine): Promise<boolean> {
+  return (await currentMode($)) === 'on'
+}
+
+function isRunning(phase: CleanViewPhase): boolean {
+  return phase === 'working' || phase === 'needsYou' || phase === 'stuck'
+}
+
+function task(id: string, name: string, status: CleanViewTask['status']): CleanViewTask {
+  const isDone = status === 'done'
+
+  return { id, name, status, percent: isDone ? 100 : 0, hasReported: isDone }
+}
+
+/** A finished step, its sub-steps checked off with it. */
+function markDone(one: CleanViewTask): CleanViewTask {
+  const subtasks = one.subtasks?.map((sub): CleanViewSubtask => ({ ...sub, status: 'done' }))
+
+  return { ...one, status: 'done', percent: 100, hasReported: true, ...(subtasks === undefined ? {} : { subtasks }) }
+}
+
+function finishAll(tasks: CleanViewTask[]): CleanViewTask[] {
+  return tasks.map(markDone)
+}
+
+/** Checks off every step before `index`, sets that step's percent and starts the next one at 100. */
+function reportAt(tasks: CleanViewTask[], index: number, percent: number): CleanViewTask[] {
+  const isFinished = percent >= 100
+  const reported = tasks.map((one, at): CleanViewTask => {
+    if (at < index || (at === index && isFinished)) {
+      return markDone(one)
+    }
+
+    if (at === index) {
+      return { ...one, status: 'active', percent, hasReported: true }
+    }
+
+    return one.status === 'active' ? { ...one, status: 'upcoming', percent: 0, hasReported: false } : one
+  })
+
+  if (!isFinished) {
+    return reported
+  }
+
+  const following = reported.findIndex((one, at) => at > index && one.status === 'upcoming')
+
+  return following < 0
+    ? reported
+    : reported.map((one, at) => (at === following ? { ...one, status: 'active', percent: 0, hasReported: false } : one))
+}
+
+function applyProgress(tasks: CleanViewTask[], rawName: string, percent: number): CleanViewTask[] {
+  const name = cleanName(rawName)
+  const found = tasks.findIndex(one => one.name.toLowerCase() === name.toLowerCase())
+
+  if (found >= 0) {
+    return reportAt(tasks, found, percent)
+  }
+
+  // An unplanned step lands where the current step is, so nothing is checked off by mistake.
+  const active = tasks.findIndex(one => one.status === 'active')
+  const at = active >= 0 ? active : tasks.filter(one => one.status === 'done').length
+  const added = [...tasks.slice(0, at), task(`extra-${tasks.length + 1}`, name, 'upcoming'), ...tasks.slice(at)]
+
+  return reportAt(added, at, percent)
+}
+
+/** The sub-steps plan_steps gave a step, keyed by its name as written or as cleaned. */
+export function plannedSubtasks(substeps: unknown, name: string): CleanViewSubtask[] | undefined {
+  if (substeps === null || typeof substeps !== 'object' || Array.isArray(substeps)) {
+    return undefined
+  }
+
+  const key = Object.keys(substeps).find(one => cleanName(one).toLowerCase() === name.toLowerCase())
+  const raw = key === undefined ? undefined : (substeps as Record<string, unknown>)[key]
+
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return undefined
+  }
+
+  return raw.slice(0, MAX_SUBSTEPS).map((sub): CleanViewSubtask => ({ name: cleanName(String(sub)), status: 'upcoming' }))
+}
+
+/**
+ * Marks the sub-step Claude says it is on: the ones before it done, the ones after upcoming.
+ * One not planned is added at the end. The step is the one named, else the active one.
+ */
+export function applySubstep(tasks: CleanViewTask[], rawTask: string, rawSub: string, percent: number): CleanViewTask[] {
+  const taskName = cleanName(rawTask).toLowerCase()
+  const named = tasks.findIndex(one => one.name.toLowerCase() === taskName)
+  const at = named >= 0 ? named : tasks.findIndex(one => one.status === 'active')
+
+  if (at < 0 || tasks[at]!.status === 'done') {
+    return tasks
+  }
+
+  const name = cleanName(rawSub)
+  const before = tasks[at]!.subtasks ?? []
+  const found = before.findIndex(sub => sub.name.toLowerCase() === name.toLowerCase())
+  const subs = found >= 0 ? before : [...before, { name, status: 'upcoming' as const }]
+  const index = found >= 0 ? found : subs.length - 1
+  const subtasks = subs.map((sub, i): CleanViewSubtask => ({
+    ...sub,
+    status: i < index || (i === index && percent >= 100) ? 'done' : i === index ? 'active' : 'upcoming',
+  }))
+
+  return tasks.map((one, i) => (i === at ? { ...one, subtasks } : one))
+}
+
+/** Lists one action under the active step, else under the last finished one. */
+export function addAction(tasks: CleanViewTask[], label: string): CleanViewTask[] {
+  const active = tasks.findIndex(one => one.status === 'active')
+  const at = active >= 0 ? active : tasks.map(one => one.status).lastIndexOf('done')
+
+  return tasks.map((one, i) =>
+    i === at ? { ...one, actions: [...(one.actions ?? []), label].slice(-MAX_ACTIONS), actionCount: (one.actionCount ?? 0) + 1 } : one,
+  )
+}
+
+function baseName(path: unknown): string {
+  return typeof path === 'string' ? (path.split(/[\\/]/).pop() ?? '') : ''
+}
+
+/** What a tool call does, in a few plain words; the Bash description Claude already wrote when there is one. */
+export function actionLabel(tool: string, input: Record<string, unknown>): string {
+  const said = (value: unknown) => (typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '')
+
+  switch (tool) {
+    case 'Bash':
+      return said(input.description) || 'Run a command'
+    case 'Read':
+      return `Read ${baseName(input.file_path)}`.trim()
+    case 'Edit':
+    case 'NotebookEdit':
+      return `Edit ${baseName(input.file_path ?? input.notebook_path)}`.trim()
+    case 'Write':
+      return `Write ${baseName(input.file_path)}`.trim()
+    case 'Grep':
+    case 'Glob':
+      return 'Search the code'
+    case 'WebSearch':
+      return 'Search the web'
+    case 'WebFetch':
+      return 'Read a web page'
+    case 'Agent':
+    case 'Task':
+      return said(input.description) ? `Ask a helper: ${said(input.description)}` : 'Ask a helper'
+    case 'Skill':
+      return said(input.skill) ? `Use the ${said(input.skill)} skill` : 'Use a skill'
+    case 'AskUserQuestion':
+      return 'Ask you a question'
+  }
+
+  const server = /^mcp__(.+?)__/.exec(tool)?.[1]
+
+  return `Use ${server ?? tool}`
+}
+
+function todoStatus(status: unknown): CleanViewTask['status'] {
+  if (status === 'completed') {
+    return 'done'
+  }
+
+  return status === 'in_progress' ? 'active' : 'upcoming'
+}
+
+function apiReason(kind: string, details: string): string {
+  const text = `${kind} ${details}`
+
+  if (/rate_limit|billing|usage limit|429/i.test(text)) {
+    return API_USAGE
+  }
+
+  if (/overloaded|server_error|529|50\d/i.test(text)) {
+    return API_BUSY
+  }
+
+  if (/too long|context|too many tokens|max_output_tokens/i.test(text)) {
+    return API_TOO_LONG
+  }
+
+  if (/authentication|oauth|credential|verification|401|403|\/login|api key/i.test(text)) {
+    return API_AUTH
+  }
+
+  if (/network|connection|connect|econn|enotfound|fetch failed|socket|offline|timed? ?out/i.test(text)) {
+    return API_NETWORK
+  }
+
+  return API_OTHER
+}
+
+function guide(tools: readonly string[]): string {
+  const hasTodos = tools.includes('TodoWrite') || tools.includes('TaskCreate')
+  const lines = [
+    '# Clean View',
+    'The person sees a simple checklist of your work instead of tool calls. Keep it accurate.',
+    '- Write every step name in plain English a non-technical person understands. Keep it under 40 characters and start it with a verb, like "Build the pricing section".',
+    '- Never put file paths, file names, commands, code or tool names in a step name.',
+    `- For every request, even a quick question, call ${PLAN_TOOL} first with 2 to 8 short steps in order. Load it with ToolSearch if it is deferred. Other tools are blocked until a plan exists.`,
+    `- Then call ${PROGRESS_TOOL} as real progress happens, and with percent 100 the moment a step finishes.`,
+    '- A step with distinct parts can list them as `substeps` in the plan; name the one you are on as `substep` in a progress call you were making anyway. Never make a call just for a sub-step.',
+  ]
+
+  if (hasTodos) {
+    lines.push('- You can use your to-do list (TodoWrite or TaskCreate) as the plan instead; the same naming rules apply.')
+  }
+
+  return lines.join('\n')
+}
+
+function padEnd(text: string, width: number): string {
+  if (width <= 0) {
+    return ''
+  }
+
+  const chars = [...text]
+
+  if (chars.length > width) {
+    return `${chars.slice(0, Math.max(0, width - 1)).join('')}…`
+  }
+
+  return text + ' '.repeat(width - chars.length)
+}
+
+type Stops = readonly string[]
+
+const PINK = '#ff4f8b'
+const TITLE_STOPS: Stops = ['#ff8a3d', '#ff4f8b', '#c86bfa', '#7aa2ff']
+const OVERALL_STOPS: Stops = ['#ff8a3d', '#ff4f8b']
+const DONE_STOPS: Stops = ['#1e8f4e', '#6ee7a0']
+const ACTIVE_STOPS: Stops = ['#8a2f5a', '#ff6fb0']
+const GRADIENT_STEPS = 8
+const SHIMMER_CELLS = 6
+/** The empty part of a bar: a dark gray box, just above the terminal background. */
+const TRACK = '#1f1f25'
+/** One bar cell. The box is narrower than the cell, so each step shows as its own box. */
+const BOX = '■'
+
+const BORDER: Record<CleanViewPhase, string> = {
+  idle: PINK,
+  working: PINK,
+  needsYou: 'yellow',
+  stuck: 'yellow',
+  stopped: 'red',
+  done: 'green',
+}
+
+function hex(color: string): number[] {
+  return [1, 3, 5].map(at => parseInt(color.slice(at, at + 2), 16))
+}
+
+/** The color at `t` (0 to 1) along evenly spaced stops. */
+export function blend(stops: Stops, t: number): string {
+  if (stops.length === 1) {
+    return stops[0]!
+  }
+
+  const at = Math.min(1, Math.max(0, t)) * (stops.length - 1)
+  const low = Math.min(stops.length - 2, Math.floor(at))
+  const from = hex(stops[low]!)
+  const to = hex(stops[low + 1]!)
+  const mix = at - low
+
+  return `#${from.map((one, i) => Math.round(one + (to[i]! - one) * mix).toString(16).padStart(2, '0')).join('')}`
+}
+
+type Cell = { char: string; color: string }
+
+/** Draws cells as Text runs, one run per color, so a long bar stays a few elements. */
+function cells($: Engine, e: RenderInput<'AbovePrompt'>, key: string, list: Cell[]): RenderElement {
+  const { Text } = $.ui.resolve(e)
+  const runs: Cell[] = []
+
+  for (const one of list) {
+    const last = runs[runs.length - 1]
+
+    if (last !== undefined && last.color === one.color) {
+      last.char += one.char
+    } else {
+      runs.push({ ...one })
+    }
+  }
+
+  return (
+    <Text key={key}>
+      {runs.map((run, at) => (
+        <Text key={`${key}-${at}`} color={run.color}>
+          {run.char}
+        </Text>
+      ))}
+    </Text>
+  )
+}
+
+/** `filled` gradient boxes, then dark track boxes, `width` in all. */
+function bar(width: number, filled: number, stops: Stops): Cell[] {
+  return Array.from({ length: width }, (_, at): Cell => {
+    if (at >= filled) {
+      return { char: BOX, color: TRACK }
+    }
+
+    const t = Math.round((filled <= 1 ? 1 : at / (filled - 1)) * (GRADIENT_STEPS - 1)) / (GRADIENT_STEPS - 1)
+
+    return { char: BOX, color: blend(stops, t) }
+  })
+}
+
+/** A short pink streak that runs along the track while a step has no percent yet. */
+function shimmer(width: number, frame: number): Cell[] {
+  const head = frame % (width + SHIMMER_CELLS)
+
+  return Array.from({ length: width }, (_, at): Cell => {
+    const behind = head - at
+
+    if (behind < 0 || behind >= SHIMMER_CELLS) {
+      return { char: BOX, color: TRACK }
+    }
+
+    return { char: BOX, color: blend(ACTIVE_STOPS, 1 - behind / (SHIMMER_CELLS - 1)) }
+  })
+}
+
+function meter(one: CleanViewTask, frame: number, width: number): Cell[] {
+  if (one.status === 'done') {
+    return bar(width, width, DONE_STOPS)
+  }
+
+  if (one.status === 'upcoming') {
+    return bar(width, 0, DONE_STOPS)
+  }
+
+  if (!one.hasReported) {
+    return shimmer(width, frame)
+  }
+
+  return bar(width, Math.round((one.percent / 100) * width), ACTIVE_STOPS)
+}
+
+/** Whole-job progress: done steps plus the active step's reported share. */
+export function overallPercent(tasks: readonly CleanViewTask[]): number {
+  if (tasks.length === 0) {
+    return 0
+  }
+
+  const share = tasks.reduce((sum, one) => {
+    if (one.status === 'done') {
+      return sum + 1
+    }
+
+    return one.status === 'active' && one.hasReported ? sum + one.percent / 100 : sum
+  }, 0)
+
+  return Math.round((share / tasks.length) * 100)
+}
+
+/** The step number the header names: the active step, or the count done when none is active. */
+function stepNumber(tasks: readonly CleanViewTask[]): number {
+  const active = tasks.findIndex(one => one.status === 'active')
+
+  return active >= 0 ? active + 1 : tasks.filter(one => one.status === 'done').length
+}
+
+let frameTimer: Timer | null = null
+let failures = 0
+let lastApiError: { kind: string; details: string } | null = null
+
+function syncClock($: Engine, list: CleanViewChecklist): void {
+  const shouldAnimate = list.phase === 'working' || list.phase === 'needsYou'
+
+  if (shouldAnimate && frameTimer === null) {
+    frameTimer = $.clock.every(FRAME_MS, () => {
+      void update($, tick, frame => frame + 1)
+    })
+  }
+
+  if (!shouldAnimate && frameTimer !== null) {
+    frameTimer.cancel()
+    frameTimer = null
+  }
+}
+
+async function change($: Engine, fn: (list: CleanViewChecklist) => CleanViewChecklist): Promise<CleanViewChecklist> {
+  const list = await update($, checklist, fn)
+  syncClock($, list)
+
+  return list
+}
+
+async function startJob($: Engine, title: string): Promise<CleanViewChecklist> {
+  const now = await $.clock.now()
+  failures = 0
+  lastApiError = null
+
+  return change($, () => ({
+    ...EMPTY,
+    title,
+    phase: 'working',
+    tasks: PLACEHOLDER_STEPS.map((name, at) => task(`placeholder-${at + 1}`, name, at === 0 ? 'active' : 'upcoming')),
+    startedAt: now,
+  }))
+}
+
+async function ensureJob($: Engine): Promise<void> {
+  const list = await read($, checklist)
+
+  if (!isRunning(list.phase)) {
+    await startJob($, FALLBACK_NAME)
+  }
+}
+
+async function nameJob($: Engine, prompt: string, startedAt: number | null): Promise<void> {
+  try {
+    const reply = await $.model.complete({
+      model: 'haiku',
+      effort: 'low',
+      maxTokens: 40,
+      timeoutMs: 15000,
+      system:
+        'Name the request as a job title a non-technical person understands: 2 to 6 plain English words that start with a verb, like "Build my landing page". No file names, paths, code or quotes. Reply with the title only.',
+      prompt: prompt.slice(0, 4000),
+    })
+
+    if (!reply.isAnswered) {
+      return
+    }
+
+    const title = jobTitle(reply.text)
+    await update($, checklist, list => (list.startedAt === startedAt ? { ...list, title } : list))
+  } catch {
+    // The header keeps its fallback name.
+  }
+}
+
+async function setStuck($: Engine, reason: string): Promise<void> {
+  await change($, list => (isRunning(list.phase) ? { ...list, phase: 'stuck', stuckReason: reason, needsYouReason: null } : list))
+}
+
+async function setNeedsYou($: Engine, reason: string): Promise<void> {
+  await ensureJob($)
+  await change($, list => ({ ...list, phase: 'needsYou', needsYouReason: reason }))
+}
+
+async function resume($: Engine): Promise<void> {
+  await change($, list =>
+    list.phase === 'needsYou' || list.phase === 'stuck'
+      ? { ...list, phase: 'working', needsYouReason: null, stuckReason: null }
+      : list,
+  )
+}
+
+async function setMode($: Engine, value: CleanViewMode): Promise<void> {
+  await update($, mode, () => value)
+  await $.store.set(STORE_KEY, value)
+  sendToolboxRow($, value)
+  $.ui.toast(MODE_TOAST[value])
+}
+
+/** The mode a Toolbox choice names, or null for an unknown one. */
+export function choiceMode(choice: unknown): CleanViewMode | null {
+  return MODES.find(one => MODE_CHOICE[one] === choice) ?? null
+}
+
+const TOOLBOX_ROW = 'clean-view.mode'
+
+/**
+ * Sends the mode switch to the Toolbox panel when the Toolbox mod is loaded.
+ * Returns false when Toolbox is not loaded, so Clean View keeps its own button.
+ */
+function sendToolboxRow($: Engine, current: CleanViewMode): boolean {
+  try {
+    $.toolbox.addSetting({
+      id: TOOLBOX_ROW,
+      label: 'Clean View',
+      hint: 'simple checklist',
+      kind: 'choice',
+      options: MODES.map(one => MODE_CHOICE[one]),
+      value: MODE_CHOICE[current],
+    })
+
+    return true
+  } catch {
+    // Toolbox is not installed or not enabled: Clean View works as before.
+    return false
+  }
+}
+
+async function storedMode($: Engine): Promise<CleanViewMode> {
+  const stored = await $.store.get(STORE_KEY)
+
+  if (isMode(stored)) {
+    return stored
+  }
+
+  const legacy = await $.store.get(LEGACY_STORE_KEY)
+
+  return legacy === false ? 'off' : 'on'
+}
+
+async function planSteps($: Engine, input: Record<string, unknown>) {
+  const raw = Array.isArray(input.steps) ? input.steps : []
+  const steps = raw.map(step => cleanName(String(step))).slice(0, MAX_STEPS)
+
+  if (steps.length < MIN_STEPS) {
+    return { deny: `Give ${MIN_STEPS} to ${MAX_STEPS} short step names, in order.` }
+  }
+
+  await ensureJob($)
+  await change($, list => ({
+    ...list,
+    phase: list.phase === 'stuck' ? 'working' : list.phase,
+    stuckReason: list.phase === 'stuck' ? null : list.stuckReason,
+    tasks: steps.map((name, at) => {
+      const subtasks = plannedSubtasks(input.substeps, name)
+      const one = task(`step-${at + 1}`, name, at === 0 ? 'active' : 'upcoming')
+
+      return subtasks === undefined ? one : { ...one, subtasks }
+    }),
+    isPlanned: true,
+  }))
+
+  return { result: `Planned ${steps.length} steps. The first one has started.` }
+}
+
+async function reportProgress($: Engine, input: Record<string, unknown>) {
+  const percent = clampPercent(input.percent)
+  await ensureJob($)
+  const substep = typeof input.substep === 'string' && input.substep.trim() !== '' ? input.substep : null
+  await change($, list => {
+    const tasks = substep === null ? list.tasks : applySubstep(list.tasks, String(input.task ?? ''), substep, 0)
+
+    return { ...list, tasks: applyProgress(tasks, String(input.task ?? ''), percent) }
+  })
+
+  return { result: `Progress noted: ${percent}%.` }
+}
+
+async function trackTodos($: Engine, input: Record<string, unknown>): Promise<void> {
+  if (!Array.isArray(input.todos)) {
+    return
+  }
+
+  const todos = input.todos as Array<Record<string, unknown>>
+  await ensureJob($)
+  await change($, list => ({
+    ...list,
+    isPlanned: list.isPlanned || todos.length > 0,
+    tasks: todos.map((todo, at) => {
+      const name = cleanName(String(todo.content ?? todo.activeForm ?? ''))
+      const status = todoStatus(todo.status)
+      const before = list.tasks.find(one => one.name === name && one.status === 'active')
+      // A rewritten list keeps what was done under each step it still has.
+      const done = list.tasks.find(one => one.name === name)
+      const kept = done?.actions === undefined ? {} : { actions: done.actions, actionCount: done.actionCount ?? done.actions.length }
+
+      return status === 'active' && before !== undefined
+        ? { ...before, id: `todo-${at + 1}` }
+        : { ...task(`todo-${at + 1}`, name, status), ...kept }
+    }),
+  }))
+}
+
+async function trackTaskCreate($: Engine, input: Record<string, unknown>, resultText: string): Promise<void> {
+  const name = cleanName(String(input.subject ?? input.description ?? ''))
+  const number = /#?(\d+)/.exec(resultText)?.[1]
+  await ensureJob($)
+  await change($, list => {
+    const kept = list.isPlanned ? list.tasks : []
+    const id = `task-${number ?? kept.length + 1}`
+
+    return { ...list, isPlanned: true, tasks: [...kept.filter(one => one.id !== id), task(id, name, 'upcoming')] }
+  })
+}
+
+async function trackTaskUpdate($: Engine, input: Record<string, unknown>): Promise<void> {
+  const id = `task-${String(input.taskId ?? '')}`
+  const subject = typeof input.subject === 'string' ? cleanName(input.subject) : null
+  await change($, list => {
+    if (input.status === 'deleted') {
+      return { ...list, tasks: list.tasks.filter(one => one.id !== id) }
+    }
+
+    const status = input.status === undefined ? null : todoStatus(input.status)
+
+    return {
+      ...list,
+      tasks: list.tasks.map(one => {
+        if (one.id !== id) {
+          return one
+        }
+
+        const named = subject === null ? one : { ...one, name: subject }
+
+        if (status === null || status === named.status) {
+          return named
+        }
+
+        return status === 'active' ? { ...named, status, percent: 0, hasReported: false } : task(id, named.name, status)
+      }),
+    }
+  })
+}
+
+async function trackOutcome($: Engine, ran: { deny?: string; isError?: true; text?: string; result?: unknown }): Promise<void> {
+  const message = ran.deny ?? ran.text ?? (typeof ran.result === 'string' ? ran.result : '')
+
+  if (USER_SAID_NO.test(message)) {
+    failures = 0
+    await setStuck($, SAID_NO)
+
+    return
+  }
+
+  if (ran.deny !== undefined) {
+    return
+  }
+
+  if (ran.isError === true) {
+    failures += 1
+
+    if (failures >= FAIL_LIMIT) {
+      await setStuck($, KEEPS_FAILING)
+    }
+
+    return
+  }
+
+  failures = 0
+  await change($, list => (list.phase === 'stuck' ? { ...list, phase: 'working', stuckReason: null } : list))
+}
+
+/** Colors each word of the title along the title gradient. */
+function gradientTitle($: Engine, e: RenderInput<'AbovePrompt'>, title: string): RenderElement {
+  const { Text } = $.ui.resolve(e)
+  const words = title.split(' ')
+
+  return (
+    <Text bold>
+      {words.map((word, at) => (
+        <Text key={`word-${at}`} color={blend(TITLE_STOPS, words.length <= 1 ? 0 : at / (words.length - 1))}>
+          {at === 0 ? word : ` ${word}`}
+        </Text>
+      ))}
+    </Text>
+  )
+}
+
+/** Draws the band; null when there is nothing to show. With Toolbox loaded, the mode switch lives in its panel. */
+async function drawBand($: Engine, e: RenderInput<'AbovePrompt'>, hasToolbox: boolean): Promise<RenderElement | null> {
+  const { Box, Text, Button } = $.ui.resolve(e)
+  const current = await currentMode($)
+  const list = await read($, checklist)
+  const frame = await read($, tick)
+  const now = await $.clock.now()
+  const width = Math.max(24, e.props.bodyColumns)
+  // The round border and one cell of padding on each side.
+  const inner = width - 4
+
+  const toggle = hasToolbox ? null : (
+    <Box key="toggle-row" flexDirection="row" justifyContent="flex-end" width={width}>
+      <Button key="toggle" label={MODE_LABEL[current]} onPress={() => setMode($, nextMode(current))} />
+    </Box>
+  )
+
+  if (current === 'off' || list.phase === 'idle') {
+    return toggle === null ? null : <Box flexDirection="column">{toggle}</Box>
+  }
+
+  const title = list.title || FALLBACK_NAME
+  const runFor = elapsed((list.finishedAt ?? now) - (list.startedAt ?? now))
+  let left: RenderElement
+
+  switch (list.phase) {
+    case 'needsYou':
+      left = (
+        <Text wrap="truncate">
+          <Text bold inverse color="yellow"> Needs you </Text> {list.needsYouReason ?? WAITING_REPLY}
+        </Text>
+      )
+      break
+    case 'stuck':
+      left = (
+        <Text wrap="truncate" color="yellow">
+          ⚠ Stuck: {list.stuckReason ?? KEEPS_FAILING}
+        </Text>
+      )
+      break
+    case 'stopped':
+      left = (
+        <Text wrap="truncate">
+          <Text color="red">■ Stopped</Text> · {title} · you pressed Esc
+        </Text>
+      )
+      break
+    case 'done':
+      left = (
+        <Text wrap="truncate">
+          <Text color="green">✓ All done</Text> · {title}
+        </Text>
+      )
+      break
+    default:
+      left = (
+        <Text wrap="truncate">
+          <Text color={PINK}>✶ </Text>
+          {gradientTitle($, e, title)}
+        </Text>
+      )
+  }
+
+  // One button per mode; the current one is bracketed and full strength, the others dim.
+  const switches = MODES.map(one =>
+    one === current ? (
+      <Button key={`mode-${one}`} plain label={`[${MODE_CHOICE[one]}]`} onPress={() => setMode($, one)} />
+    ) : (
+      <Button key={`mode-${one}`} plain dimColor label={` ${MODE_CHOICE[one]} `} onPress={() => setMode($, one)} />
+    ),
+  )
+  // A finished list stays until the next request or until this button clears it.
+  const clear = isRunning(list.phase) ? null : (
+    <Button key="clear" plain dimColor label=" ✕ Clear " onPress={() => change($, () => EMPTY)} />
+  )
+  const header = (
+    <Box key="header" flexDirection="row" justifyContent="space-between" width={inner}>
+      <Box flexShrink={1}>{left}</Box>
+      <Box key="header-right" flexDirection="row" flexShrink={0}>
+        {switches}
+        {clear}
+        <Text dimColor> {runFor}</Text>
+      </Box>
+    </Box>
+  )
+  const frameBox = (children: RenderElement[]) => (
+    <Box key="frame" flexDirection="column" borderStyle="round" borderColor={BORDER[list.phase]} paddingX={1} width={width}>
+      {children}
+    </Box>
+  )
+
+  const total = list.tasks.length
+  const percent = overallPercent(list.tasks)
+  const stepLabel = `Step ${stepNumber(list.tasks)} of ${total} `
+  // label + bar + gap (1) + percent (4)
+  const overallWidth = Math.max(4, inner - stepLabel.length - 1 - 4)
+  const overall = (
+    <Box key="overall" flexDirection="row">
+      <Text>{stepLabel}</Text>
+      {cells($, e, 'overall-bar', bar(overallWidth, Math.round((percent / 100) * overallWidth), OVERALL_STOPS))}
+      <Text bold color={PINK}> {`${percent}%`.padStart(4)}</Text>
+    </Box>
+  )
+
+  // icon (2) + name + meter + gap (2) + label (7)
+  const meterWidth = Math.max(4, Math.min(METER_CELLS, inner - 2 - 12 - 2 - 7))
+  const nameWidth = Math.max(4, Math.min(MAX_NAME + 2, inner - 2 - meterWidth - 2 - 7))
+  const firstUpcoming = list.tasks.findIndex(one => one.status === 'upcoming')
+  // Room left of the row after icon, name, meter and the longest label ("  Up next").
+  const room = inner - 2 - nameWidth - meterWidth - 9
+  // A folded step counts its sub-steps and actions at the row's end, when they fit.
+  const counts = (one: CleanViewTask) => {
+    const subs = one.subtasks?.length ?? 0
+    const did = one.actionCount ?? 0
+    const many = (n: number, word: string) => (n > 0 ? `${n} ${word}${n === 1 ? '' : 's'}` : '')
+    const text = [many(subs, 'sub-step'), many(did, 'action')].filter(Boolean).join(' · ')
+
+    return text !== '' && text.length + 3 <= room ? <Text dimColor>{` · ${text}`}</Text> : null
+  }
+  // The active step unfolds: its sub-steps, then what was done, newest last.
+  const unfold = (one: CleanViewTask): RenderElement[] => {
+    const width = inner - 6
+    const subs = (one.subtasks ?? []).map((sub, at) => {
+      const key = `sub-${one.id}-${at}`
+      const name = padEnd(sub.name, width)
+
+      if (sub.status === 'done') {
+        return (
+          <Box key={key}>
+            <Text wrap="truncate">
+              {'    '}
+              <Text color="green">✓ </Text>
+              <Text dimColor>{name}</Text>
+            </Text>
+          </Box>
+        )
+      }
+
+      if (sub.status === 'active') {
+        return (
+          <Box key={key}>
+            <Text wrap="truncate">
+              {'    '}
+              <Text color={PINK}>● </Text>
+              <Text bold>{name}</Text>
+            </Text>
+          </Box>
+        )
+      }
+
+      return (
+        <Box key={key}>
+          <Text wrap="truncate" dimColor>
+            {'    '}○ {name}
+          </Text>
+        </Box>
+      )
+    })
+    const actions = one.actions ?? []
+    const earlier = (one.actionCount ?? actions.length) - actions.length
+    const did = actions.map((label, at) => (
+      <Box key={`act-${one.id}-${at}`}>
+        <Text wrap="truncate" dimColor>
+          {'    ↳ '}
+          {padEnd(label, width)}
+        </Text>
+      </Box>
+    ))
+
+    return earlier > 0
+      ? [...subs, <Box key={`act-${one.id}-earlier`}><Text dimColor>{`    ↳ … ${earlier} earlier`}</Text></Box>, ...did]
+      : [...subs, ...did]
+  }
+  const rows = list.tasks.flatMap((one, at): RenderElement[] => {
+    const name = `${padEnd(one.name, nameWidth - 1)} `
+    const track = cells($, e, `meter-${one.id}`, meter(one, frame, meterWidth))
+
+    if (one.status === 'done') {
+      return [
+        <Box key={`row-${one.id}`} flexDirection="row">
+          <Text color="green">✓ </Text>
+          <Text>{name}</Text>
+          {track}
+          <Text>  Done</Text>
+          {counts(one)}
+        </Box>,
+      ]
+    }
+
+    if (one.status === 'active') {
+      const isWaiting = list.phase === 'needsYou'
+
+      return [
+        <Box key={`row-${one.id}`} flexDirection="row">
+          <Text color={isWaiting ? 'yellow' : PINK}>{isWaiting ? '‖ ' : '● '}</Text>
+          <Text bold>{name}</Text>
+          {track}
+          <Text bold color={PINK}>
+            {'  '}
+            {one.hasReported ? `${one.percent}%` : 'Working'}
+          </Text>
+        </Box>,
+        ...unfold(one),
+      ]
+    }
+
+    return [
+      <Box key={`row-${one.id}`} flexDirection="row">
+        <Text dimColor>○ </Text>
+        <Text dimColor>{name}</Text>
+        {track}
+        <Text dimColor>  {at === firstUpcoming ? 'Next' : 'Up next'}</Text>
+        {counts(one)}
+      </Box>,
+    ]
+  })
+
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      {toggle}
+      {frameBox([header, overall, ...rows])}
+    </Box>
+  )
+}
+
+export function registerCleanView(on: On): void {
+  on('session.start', async ($, e, next) => {
+    await $.tool.register({
+      name: 'plan_steps',
+      description:
+        'Lay out every step of the current job up front, in order, so the person sees a simple checklist. Call it first for every request. Each step is plain English, under 40 characters, starts with a verb, and never holds file paths, file names, commands, code or tool names.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          steps: {
+            type: 'array',
+            items: { type: 'string' },
+            minItems: MIN_STEPS,
+            maxItems: MAX_STEPS,
+            description: '2 to 8 short step names, in order, like "Build the pricing section".',
+          },
+          substeps: {
+            type: 'object',
+            additionalProperties: { type: 'array', items: { type: 'string' }, maxItems: MAX_SUBSTEPS },
+            description: 'Optional: sub-steps for any step, keyed by its step name, up to 6 each, same naming rules.',
+          },
+        },
+        required: ['steps'],
+      },
+    })
+    await $.tool.register({
+      name: 'report_progress',
+      description:
+        'Report progress on the current step of the plan. Call it as real progress happens, and with percent 100 the moment a step finishes; the next step then starts by itself. Use the step name exactly as planned.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: 'The step name, as given to plan_steps.' },
+          percent: { type: 'number', minimum: 0, maximum: 100, description: 'How far along the step is, 0 to 100.' },
+          substep: { type: 'string', description: 'Optional: the sub-step you are on now; earlier ones are checked off.' },
+        },
+        required: ['task', 'percent'],
+      },
+    })
+    await $.command.register({
+      name: 'simple',
+      description: 'Set Clean View: on hides details, both shows details and the checklist, off (no argument cycles)',
+      argumentHint: 'on|both|off',
+    })
+
+    const stored = await storedMode($)
+    await update($, mode, () => stored)
+    syncClock($, await read($, checklist))
+    sendToolboxRow($, stored)
+
+    return next(e)
+  })
+
+  // A click on Clean View's row in the Toolbox panel.
+  on('state.set', { plugin: 'toolbox', key: 'press' }, async ($, e, next) => {
+    const result = await next(e)
+    const pressed = e.value
+    const value = pressed !== null && pressed.id === TOOLBOX_ROW ? choiceMode(pressed.value) : null
+
+    if (value !== null) {
+      await setMode($, value)
+    }
+
+    return result
+  })
+
+  on('command.run', { command: 'simple' }, async ($, e) => {
+    const arg = e.args.trim().toLowerCase()
+
+    if (arg !== '' && !isMode(arg)) {
+      return { text: 'Use /simple on, /simple both, /simple off, or /simple to go to the next mode.' }
+    }
+
+    const value = arg === '' ? nextMode(await currentMode($)) : arg
+    await setMode($, value)
+
+    return { text: MODE_REPLY[value] }
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+
+    if (!(await isTracking($))) {
+      return composed
+    }
+
+    const sections = composed.sections.filter(section => section.id !== SECTION_ID)
+
+    return { ...composed, sections: [...sections, { id: SECTION_ID, text: guide(e.tools), scope: 'session' as const }] }
+  })
+
+  on('turn.start', async ($, e, next) => {
+    const text = e.text.trim()
+
+    if (text === '' || text.startsWith('/')) {
+      return next(e)
+    }
+
+    const list = await read($, checklist)
+
+    if (isRunning(list.phase)) {
+      await resume($)
+
+      return next(e)
+    }
+
+    const started = await startJob($, FALLBACK_NAME)
+
+    if (await isTracking($)) {
+      void nameJob($, text, started.startedAt)
+    }
+
+    return next(e)
+  })
+
+  on('tool.call', async ($, e, next) => {
+    const tool = String(e.tool)
+    const input = e as unknown as Record<string, unknown>
+    const isMain = e.agentId === undefined
+
+    if (isMain && !ALWAYS_ALLOWED.has(tool) && (await isTracking($)) && !(await read($, checklist)).isPlanned) {
+      return { deny: GATE_MESSAGE }
+    }
+
+    if (tool === PLAN_TOOL) {
+      return planSteps($, input)
+    }
+
+    if (tool === PROGRESS_TOOL) {
+      return reportProgress($, input)
+    }
+
+    if (!isMain) {
+      return next(e)
+    }
+
+    if (tool === 'AskUserQuestion') {
+      await setNeedsYou($, HAS_QUESTION)
+    } else {
+      await resume($)
+    }
+
+    if (!PLAN_KEEPING.has(tool)) {
+      const label = actionLabel(tool, input)
+      await change($, list => ({ ...list, tasks: addAction(list.tasks, label) }))
+    }
+
+    const ran = await next(e)
+
+    await change($, list => (list.phase === 'needsYou' ? { ...list, phase: 'working', needsYouReason: null } : list))
+
+    if (ran.deny === undefined && ran.isError !== true) {
+      if (tool === 'TodoWrite') {
+        await trackTodos($, input)
+      } else if (tool === 'TaskCreate') {
+        await trackTaskCreate($, input, ran.text ?? JSON.stringify(ran.result ?? ''))
+      } else if (tool === 'TaskUpdate') {
+        await trackTaskUpdate($, input)
+      }
+    }
+
+    await trackOutcome($, ran)
+
+    return ran
+  })
+
+  on('classic.Notification', async ($, e, next) => {
+    if (e.notification_type === 'permission_prompt') {
+      await setNeedsYou($, NEEDS_OK)
+    } else if (e.notification_type === 'elicitation_dialog') {
+      await setNeedsYou($, HAS_QUESTION)
+    }
+
+    return next(e)
+  })
+
+  on('classic.StopFailure', async ($, e, next) => {
+    lastApiError = { kind: e.error, details: e.error_details ?? e.last_assistant_message ?? '' }
+    await setStuck($, apiReason(lastApiError.kind, lastApiError.details))
+
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId !== undefined) {
+      return next(e)
+    }
+
+    const list = await read($, checklist)
+
+    if (!isRunning(list.phase)) {
+      return next(e)
+    }
+
+    const now = await $.clock.now()
+    const apiError = lastApiError
+    failures = 0
+    lastApiError = null
+
+    if (e.reason === 'error') {
+      await setStuck($, apiReason(apiError?.kind ?? '', apiError?.details ?? e.answer))
+    } else if (e.reason === 'refusal') {
+      await setStuck($, REFUSED)
+    } else if (e.reason === 'aborted') {
+      await change($, current => ({ ...current, phase: 'stopped', needsYouReason: null, stuckReason: null, finishedAt: now }))
+    } else if (list.isPlanned && list.tasks.some(one => one.status !== 'done')) {
+      await change($, current => ({ ...current, phase: 'needsYou', needsYouReason: WAITING_REPLY, stuckReason: null }))
+    } else {
+      await change($, current => ({
+        ...current,
+        phase: 'done',
+        tasks: finishAll(current.tasks),
+        needsYouReason: null,
+        stuckReason: null,
+        finishedAt: now,
+      }))
+    }
+
+    return next(e)
+  })
+
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const { Box } = $.ui.resolve(e)
+
+    return (await isHiding($)) ? <Box display="none" /> : next(e)
+  })
+
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
+    const { Box } = $.ui.resolve(e)
+
+    return (await isHiding($)) ? <Box display="none" /> : next(e)
+  })
+
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
+    const { Box } = $.ui.resolve(e)
+
+    return (await isHiding($)) ? <Box display="none" /> : next(e)
+  })
+
+  on('ui.render', { component: 'ToolProgress' }, async ($, e, next) =>
+    (await isHiding($)) ? next({ ...e, props: { ...e.props, hint: '' } }) : next(e),
+  )
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) {
+      return next(e)
+    }
+
+    // Sent on each draw, so the Toolbox panel has the row again after Toolbox reloads.
+    const hasToolbox = sendToolboxRow($, await currentMode($))
+    const { Box } = $.ui.resolve(e)
+    const band = await drawBand($, e, hasToolbox)
+    const beneath = await next(e)
+
+    if (band === null) {
+      return beneath
+    }
+
+    return (
+      <Box flexDirection="column">
+        {band}
+        {beneath}
+      </Box>
+    )
+  })
+}

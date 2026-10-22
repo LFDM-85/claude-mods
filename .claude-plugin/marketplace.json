@@ -1,0 +1,9 @@
+{
+  "name": "claude-mods",
+  "description": "glowup and Clean View forks with token, flow and sub-step views.",
+  "owner": { "name": "LFDM-85" },
+  "plugins": [
+    { "name": "glowup-plus", "source": "./glowup-plus", "description": "glowup fork with Tokens (cache reads per model request) and Flow (diagram of the last turn) tabs." },
+    { "name": "clean-view-plus", "source": "./clean-view-plus", "description": "Clean View fork whose checklist unfolds sub-steps and the actions done under the active step." }
+  ]
+}
